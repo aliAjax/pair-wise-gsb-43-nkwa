@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import rules
+
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "public_procurement.db"
 
@@ -162,8 +164,55 @@ class ProcurementService:
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS score_handoffs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tender_id INTEGER NOT NULL REFERENCES tenders(id),
+                    evaluation_round INTEGER NOT NULL,
+                    original_evaluator TEXT NOT NULL,
+                    successor_evaluator TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    consumed INTEGER NOT NULL DEFAULT 0,
+                    designated_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    revoked_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS score_corrections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tender_id INTEGER NOT NULL REFERENCES tenders(id),
+                    bid_id INTEGER NOT NULL REFERENCES bids(id),
+                    evaluation_id INTEGER NOT NULL REFERENCES evaluations(id),
+                    evaluation_round INTEGER NOT NULL,
+                    criterion TEXT NOT NULL,
+                    handoff_id INTEGER NOT NULL REFERENCES score_handoffs(id),
+                    original_evaluator TEXT NOT NULL,
+                    successor_evaluator TEXT NOT NULL,
+                    handoff_reason TEXT NOT NULL,
+                    old_raw_value REAL NOT NULL,
+                    new_raw_value REAL NOT NULL,
+                    old_score REAL NOT NULL,
+                    new_score REAL NOT NULL,
+                    corrected_by TEXT NOT NULL,
+                    authorized_by TEXT NOT NULL,
+                    processed_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS ranking_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tender_id INTEGER NOT NULL REFERENCES tenders(id),
+                    evaluation_round INTEGER NOT NULL,
+                    trigger_action TEXT NOT NULL,
+                    ranking TEXT NOT NULL,
+                    incomplete_bids TEXT NOT NULL DEFAULT '[]',
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_bids_tender ON bids(tender_id,status);
                 CREATE INDEX IF NOT EXISTS idx_eval_bid_round ON evaluations(bid_id,evaluation_round);
+                CREATE INDEX IF NOT EXISTS idx_eval_tender_round ON evaluations(evaluation_round);
+                CREATE INDEX IF NOT EXISTS idx_corr_round ON score_corrections(tender_id,evaluation_round);
+                CREATE INDEX IF NOT EXISTS idx_corr_eval ON score_corrections(evaluation_id);
+                CREATE INDEX IF NOT EXISTS idx_handoff_round ON score_handoffs(tender_id,evaluation_round,status);
+                CREATE INDEX IF NOT EXISTS idx_rank_round ON ranking_snapshots(tender_id,evaluation_round,id);
                 """
             )
 
@@ -395,13 +444,10 @@ class ProcurementService:
                     raw = float(values[criterion["name"]])
                 except (TypeError, ValueError) as exc:
                     raise DomainError("评分值必须是数值") from exc
-                if raw < 0 or raw > criterion["max_value"]:
-                    raise DomainError("评分值超出范围: " + criterion["name"])
-                if criterion["kind"] == "direct":
-                    score = raw / criterion["max_value"] * 100
-                else:
-                    benchmark = criterion["max_value"]
-                    score = min(100.0, benchmark / raw * 100) if raw > 0 else 0.0
+                try:
+                    score = rules.score_for(criterion, raw)
+                except rules.RuleError as exc:
+                    raise DomainError(str(exc)) from exc
                 existing = conn.execute(
                     """SELECT * FROM evaluations WHERE bid_id=? AND evaluation_round=? AND evaluator=? AND criterion=?""",
                     (bid_id, tender["evaluation_round"], actor, criterion["name"]),
@@ -514,6 +560,178 @@ class ProcurementService:
             self._audit(conn, complaint["tender_id"], actor, "complaint.resolved", {"complaint_id": complaint_id, "decision": decision})
             return dict(conn.execute("SELECT * FROM complaints WHERE id=?", (complaint_id,)).fetchone())
 
+    def _round_score_rows(self, conn: sqlite3.Connection, tender: sqlite3.Row) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """取当前评审轮次的原评分记录与更正记录。"""
+        evaluations = [dict(r) for r in conn.execute(
+            "SELECT * FROM evaluations WHERE evaluation_round=? AND bid_id IN (SELECT id FROM bids WHERE tender_id=?)",
+            (tender["evaluation_round"], tender["id"]),
+        ).fetchall()]
+        corrections = [dict(r) for r in conn.execute(
+            "SELECT * FROM score_corrections WHERE tender_id=? AND evaluation_round=?",
+            (tender["id"], tender["evaluation_round"]),
+        ).fetchall()]
+        return evaluations, corrections
+
+    def designate_handoff(self, actor: str, role: str, tender_id: int,
+                          original_evaluator: str, successor_evaluator: str,
+                          reason: str) -> dict[str, Any]:
+        """监督员指定接手人并写明原因，作为评分更正的前置授权。"""
+        actor = clean_actor(actor)
+        require_role(role, {"supervisor"}, "指定接手人")
+        original_evaluator = (original_evaluator or "").strip()
+        successor_evaluator = (successor_evaluator or "").strip()
+        reason = (reason or "").strip()
+        if not original_evaluator or not successor_evaluator:
+            raise DomainError("原评审人与接手人不能为空")
+        if original_evaluator == successor_evaluator:
+            raise DomainError("接手人不能与原评审人相同")
+        if not reason:
+            raise DomainError("交接原因不能为空")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            tender = self._tender(conn, tender_id)
+            if tender["status"] not in {"opened", "reevaluation"} or tender["evaluations_locked"]:
+                raise DomainError("当前项目不能办理评分交接", 409)
+            prior_evaluations, prior_corrections = self._round_score_rows(conn, tender)
+            prior_seats = rules.effective_seats(prior_evaluations, prior_corrections)
+            active_handoffs = [dict(r) for r in conn.execute(
+                "SELECT * FROM score_handoffs WHERE tender_id=? AND evaluation_round=? AND status='active' AND consumed=0",
+                (tender_id, tender["evaluation_round"]),
+            ).fetchall()]
+            # 原评审人可以是原评分人，也可以是交接链上当前持有席位的接手人
+            held = False
+            for seat in prior_seats:
+                if seat["effective_evaluator"] != original_evaluator:
+                    continue
+                already = any(
+                    h["original_evaluator"] == original_evaluator
+                    and h["successor_evaluator"] != original_evaluator
+                    for h in active_handoffs
+                )
+                if already:
+                    raise DomainError("该评审人持有的评分已有进行中的交接，不能重复指定", 409)
+                held = True
+            if not held:
+                raise DomainError("原评审人在本轮没有可交接的有效评分")
+            if any(h["successor_evaluator"] == successor_evaluator and
+                   h["original_evaluator"] == original_evaluator for h in active_handoffs):
+                raise DomainError("该接手授权已存在，不能重复指定", 409)
+            now = utcnow()
+            cur = conn.execute(
+                """INSERT INTO score_handoffs(tender_id,evaluation_round,original_evaluator,successor_evaluator,reason,designated_by,created_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (tender_id, tender["evaluation_round"], original_evaluator, successor_evaluator, reason, actor, now),
+            )
+            self._audit(conn, tender_id, actor, "score.handoff_designated", {
+                "handoff_id": cur.lastrowid, "evaluation_round": tender["evaluation_round"],
+                "original_evaluator": original_evaluator, "successor_evaluator": successor_evaluator, "reason": reason,
+            })
+            return dict(conn.execute("SELECT * FROM score_handoffs WHERE id=?", (cur.lastrowid,)).fetchone())
+
+    def correct_score(self, actor: str, role: str, handoff_id: int, bid_id: int,
+                      values: dict[str, float]) -> dict[str, Any]:
+        """由指定接手人凭有效交接授权提交更正分值；原记录只读，更正全部留痕。"""
+        actor = clean_actor(actor)
+        require_role(role, {"evaluator"}, "评分更正")
+        if not isinstance(values, dict) or not values:
+            raise DomainError("更正评分必须提供至少一个评分项")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            handoff = conn.execute("SELECT * FROM score_handoffs WHERE id=?", (handoff_id,)).fetchone()
+            if not handoff:
+                raise DomainError("交接授权不存在", 404)
+            if handoff["status"] != "active":
+                raise DomainError("交接授权已失效，不能更正", 409)
+            if handoff["consumed"]:
+                raise DomainError("该交接授权已用于更正，再次更正须由监督员重新指定接手人", 409)
+            if handoff["successor_evaluator"] != actor:
+                raise DomainError("只有指定接手人可以提交更正", 403)
+            bid = conn.execute("SELECT * FROM bids WHERE id=?", (bid_id,)).fetchone()
+            if not bid:
+                raise DomainError("投标不存在", 404)
+            if bid["tender_id"] != handoff["tender_id"]:
+                raise DomainError("投标与交接授权不属于同一项目", 409)
+            tender = self._tender(conn, bid["tender_id"])
+            if tender["status"] not in {"opened", "reevaluation"} or tender["evaluations_locked"]:
+                raise DomainError("当前项目不能评分更正", 409)
+            if handoff["evaluation_round"] != tender["evaluation_round"]:
+                raise DomainError("交接授权属于旧评审轮次，不能更正", 409)
+            if bid["status"] not in {"opened", "qualified"}:
+                raise DomainError("该投标不能评分更正", 409)
+            conflict = conn.execute(
+                "SELECT 1 FROM conflicts WHERE tender_id=? AND evaluator=? AND (vendor_id=? OR vendor_id IS NULL)",
+                (tender["id"], actor, bid["vendor_id"]),
+            ).fetchone()
+            if conflict:
+                raise DomainError("接手人与该供应商存在利益冲突", 403)
+            criteria = json.loads(tender["criteria"])
+            criteria_by_name = {c["name"]: c for c in criteria}
+            unknown = [name for name in values if name not in criteria_by_name]
+            if unknown:
+                raise DomainError("未知评分项: " + ",".join(unknown))
+            reason = (handoff["reason"] or "").strip()
+            if not reason:
+                raise DomainError("交接原因缺失，不能提交更正", 409)
+            evaluations, corrections = self._round_score_rows(conn, tender)
+            seats = {(s["bid_id"], s["criterion"]): s
+                     for s in rules.effective_seats(evaluations, corrections)}
+            created: list[dict[str, Any]] = []
+            now = utcnow()
+            for name, raw_input in values.items():
+                seat = seats.get((bid_id, name))
+                if seat is None:
+                    raise DomainError("该投标没有此评分项的原记录，不能更正: " + name)
+                # 授权链起点必须等于席位当前有效持有人：首次更正时为原评审人，
+                # 再次交接后为上一任接手人
+                if seat["effective_evaluator"] != handoff["original_evaluator"]:
+                    raise DomainError(
+                        "该评分项不由被交接评审人当前持有，需要按当前持有人重新指定接手人: " + name, 409
+                    )
+                try:
+                    raw = float(raw_input)
+                except (TypeError, ValueError) as exc:
+                    raise DomainError("评分值必须是数值") from exc
+                try:
+                    new_score = rules.score_for(criteria_by_name[name], raw)
+                except rules.RuleError as exc:
+                    raise DomainError(str(exc)) from exc
+                cur = conn.execute(
+                    """INSERT INTO score_corrections(tender_id,bid_id,evaluation_id,evaluation_round,criterion,handoff_id,
+                                                     original_evaluator,successor_evaluator,handoff_reason,
+                                                     old_raw_value,new_raw_value,old_score,new_score,
+                                                     corrected_by,authorized_by,processed_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (tender["id"], bid_id, seat["evaluation_id"], tender["evaluation_round"], name, handoff_id,
+                     handoff["original_evaluator"], actor, reason,
+                     seat["raw_value"], raw, seat["score"], new_score,
+                     actor, handoff["designated_by"], now),
+                )
+                row = dict(conn.execute("SELECT * FROM score_corrections WHERE id=?", (cur.lastrowid,)).fetchone())
+                created.append(row)
+                self._audit(conn, tender["id"], actor, "score.corrected", {
+                    "correction_id": row["id"], "bid_id": bid_id, "criterion": name,
+                    "handoff_id": handoff_id, "original_evaluator": handoff["original_evaluator"],
+                    "old_raw_value": row["old_raw_value"], "new_raw_value": row["new_raw_value"],
+                    "old_score": row["old_score"], "new_score": row["new_score"],
+                    "reason": reason, "processed_at": now,
+                })
+            conn.execute("UPDATE score_handoffs SET consumed=1 WHERE id=?", (handoff_id,))
+            # 更正后按有效分值重算本轮排名，并留一版快照供历史追查
+            evaluations, corrections = self._round_score_rows(conn, tender)
+            bid_rows = [dict(b) for b in conn.execute(
+                "SELECT * FROM bids WHERE tender_id=? AND status IN ('opened','qualified')", (tender["id"],)
+            ).fetchall()]
+            ranking, incomplete = rules.rank_bids(bid_rows, evaluations, corrections, criteria)
+            conn.execute(
+                """INSERT INTO ranking_snapshots(tender_id,evaluation_round,trigger_action,ranking,incomplete_bids,created_by,created_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (tender["id"], tender["evaluation_round"], "score.corrected",
+                 json.dumps(ranking, ensure_ascii=False), json.dumps(incomplete, ensure_ascii=False), actor, now),
+            )
+            conn.execute("UPDATE tenders SET version=version+1,updated_at=? WHERE id=?", (now, tender["id"]))
+            return {"bid_id": bid_id, "corrected_by": actor, "round": tender["evaluation_round"],
+                    "corrections": created, "ranking": ranking, "incomplete_bids": incomplete}
+
     def award_tender(self, actor: str, role: str, tender_id: int, expected_version: int) -> dict[str, Any]:
         actor = clean_actor(actor)
         require_role(role, {"supervisor"}, "授标")
@@ -527,33 +745,52 @@ class ProcurementService:
             open_complaint = conn.execute("SELECT COUNT(*) AS c FROM complaints WHERE tender_id=? AND status='open'", (tender_id,)).fetchone()["c"]
             if open_complaint:
                 raise DomainError("存在未处理投诉，不能授标", 409)
-            bids = conn.execute("SELECT * FROM bids WHERE tender_id=? AND status IN ('opened','qualified')", (tender_id,)).fetchall()
+            # 交接与更正必须写明原因，原因缺失一律拦截
+            missing_handoff = conn.execute(
+                "SELECT COUNT(*) AS c FROM score_handoffs WHERE tender_id=? AND evaluation_round=? AND NULLIF(TRIM(reason),'') IS NULL",
+                (tender_id, tender["evaluation_round"]),
+            ).fetchone()["c"]
+            if missing_handoff:
+                raise DomainError("存在交接原因缺失的评分交接，不能授标", 409)
+            missing_correction = conn.execute(
+                "SELECT COUNT(*) AS c FROM score_corrections WHERE tender_id=? AND evaluation_round=? AND NULLIF(TRIM(handoff_reason),'') IS NULL",
+                (tender_id, tender["evaluation_round"]),
+            ).fetchone()["c"]
+            if missing_correction:
+                raise DomainError("存在交接原因缺失的评分更正，不能授标", 409)
+            bid_rows = conn.execute("SELECT * FROM bids WHERE tender_id=? AND status IN ('opened','qualified')", (tender_id,)).fetchall()
+            bids = [dict(b) for b in bid_rows]
             criteria = json.loads(tender["criteria"])
-            expected_criteria = {c["name"] for c in criteria}
-            ranking = []
-            for bid in bids:
-                rows = conn.execute(
-                    "SELECT criterion,AVG(score) AS score FROM evaluations WHERE bid_id=? AND evaluation_round=? GROUP BY criterion",
-                    (bid["id"], tender["evaluation_round"]),
-                ).fetchall()
-                scores = {row["criterion"]: row["score"] for row in rows}
-                if set(scores) != expected_criteria:
-                    raise DomainError("投标尚未完成全部评分: %s" % bid["id"], 409)
-                weighted = 0.0
-                for criterion in criteria:
-                    weighted += scores[criterion["name"]] * criterion["weight"] / 100
-                ranking.append({"bid_id": bid["id"], "vendor_id": bid["vendor_id"], "price": bid["price"], "score": round(weighted, 2)})
+            evaluations, corrections = self._round_score_rows(conn, tender)
+            ranking, incomplete = rules.rank_bids(bids, evaluations, corrections, criteria)
+            if incomplete:
+                raise DomainError("投标尚未完成全部评分: %s" % ",".join(str(i) for i in incomplete), 409)
             if not ranking:
                 raise DomainError("没有可授标的有效投标", 409)
-            ranking.sort(key=lambda item: (-item["score"], item["price"], item["bid_id"]))
             winner = ranking[0]
-            snapshot = {"tender_id": tender_id, "round": tender["evaluation_round"], "ranking": ranking, "winner": winner, "awarded_by": actor, "awarded_at": utcnow()}
+            now = utcnow()
+            correction_summary = [
+                {"correction_id": item["id"], "bid_id": item["bid_id"], "criterion": item["criterion"],
+                 "original_evaluator": item["original_evaluator"], "successor_evaluator": item["successor_evaluator"],
+                 "old_score": item["old_score"], "new_score": item["new_score"], "reason": item["handoff_reason"],
+                 "processed_at": item["processed_at"]}
+                for item in corrections
+            ]
+            snapshot = {"tender_id": tender_id, "round": tender["evaluation_round"], "ranking": ranking,
+                        "winner": winner, "corrections": correction_summary,
+                        "awarded_by": actor, "awarded_at": now}
             conn.execute(
                 "UPDATE tenders SET status='awarded',awarded_bid_id=?,award_snapshot=?,evaluations_locked=1,version=version+1,updated_at=? WHERE id=? AND version=?",
-                (winner["bid_id"], json.dumps(snapshot, ensure_ascii=False), utcnow(), tender_id, expected_version),
+                (winner["bid_id"], json.dumps(snapshot, ensure_ascii=False), now, tender_id, expected_version),
             )
             conn.execute("UPDATE bids SET status='awarded',version=version+1 WHERE id=?", (winner["bid_id"],))
-            self._audit(conn, tender_id, actor, "tender.awarded", {"winner": winner, "ranking": ranking})
+            conn.execute(
+                """INSERT INTO ranking_snapshots(tender_id,evaluation_round,trigger_action,ranking,incomplete_bids,created_by,created_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (tender_id, tender["evaluation_round"], "tender.awarded",
+                 json.dumps(ranking, ensure_ascii=False), json.dumps(incomplete, ensure_ascii=False), actor, now),
+            )
+            self._audit(conn, tender_id, actor, "tender.awarded", {"winner": winner, "ranking": ranking, "corrections": correction_summary})
             return {"tender": dict(self._tender(conn, tender_id)), "award": snapshot}
 
     def get_tender(self, actor: str, role: str, tender_id: int) -> dict[str, Any]:
@@ -582,7 +819,43 @@ class ProcurementService:
                 "SELECT id,tender_id,vendor_id,question,answer,status,answered_at FROM clarifications WHERE tender_id=? AND status='published' ORDER BY id",
                 (tender_id,),
             ).fetchall()]
-            return {"tender": tender, "bids": bids, "clarifications": clarifications}
+            # 开标后任何角色都可查看有效分值与更正留痕；开标前不暴露评分信息
+            scoring = None
+            if tender["status"] in {"opened", "reevaluation", "awarded"}:
+                round_no = tender["evaluation_round"]
+                evaluations, corrections = self._round_score_rows(conn, tender)
+                seats = rules.effective_seats(evaluations, corrections)
+                bid_rows = [dict(b) for b in conn.execute(
+                    "SELECT id,vendor_id,price,status FROM bids WHERE tender_id=? AND status IN ('opened','qualified','awarded') ORDER BY id",
+                    (tender_id,),
+                ).fetchall()]
+                ranking, incomplete = rules.rank_bids(
+                    bid_rows, evaluations, corrections, json.loads(tender["criteria"])
+                )
+                handoffs = [dict(r) for r in conn.execute(
+                    "SELECT * FROM score_handoffs WHERE tender_id=? ORDER BY id", (tender_id,)
+                ).fetchall()]
+                ranking_history = []
+                for row in conn.execute(
+                    "SELECT id,evaluation_round,trigger_action,ranking,incomplete_bids,created_by,created_at FROM ranking_snapshots WHERE tender_id=? ORDER BY id",
+                    (tender_id,),
+                ).fetchall():
+                    item = dict(row)
+                    item["ranking"] = json.loads(item["ranking"])
+                    item["incomplete_bids"] = json.loads(item["incomplete_bids"])
+                    ranking_history.append(item)
+                award_snapshot = tender["award_snapshot"]
+                scoring = {
+                    "round": round_no,
+                    "effective_scores": seats,
+                    "corrections": corrections,
+                    "handoffs": handoffs,
+                    "ranking": ranking,
+                    "incomplete_bids": incomplete,
+                    "ranking_history": ranking_history,
+                    "award_snapshot": json.loads(award_snapshot) if award_snapshot else None,
+                }
+            return {"tender": tender, "bids": bids, "clarifications": clarifications, "scoring": scoring}
 
     def state(self, actor: str = "", role: str = "public") -> dict[str, Any]:
         with self.connect() as conn:
@@ -714,6 +987,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.submit_complaint(actor, role, **data)
             elif path == "/api/complaints/resolve":
                 result = self.service.resolve_complaint(actor, role, **data)
+            elif path == "/api/score-handoffs":
+                result = self.service.designate_handoff(actor, role, **data)
+            elif path == "/api/evaluations/correct":
+                result = self.service.correct_score(actor, role, **data)
             elif path == "/api/tenders/award":
                 result = self.service.award_tender(actor, role, **data)
             else:
