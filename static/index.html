@@ -1,6 +1,81 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>公共采购密封投标</title>
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1180px;margin:28px auto;padding:0 20px;color:#28343e}table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d5dde3;padding:7px}th{background:#eef4f7}.card{background:#eef8f3;border-left:5px solid #23845b;padding:12px 16px}code{background:#edf0f2;padding:2px 5px}</style>
-<h1>公共采购密封投标与评审</h1><div class="card">公开页面只展示项目元数据，投标正文按角色和执行阶段隐藏。写接口需要 <code>X-User</code>、<code>X-Role</code>。</div>
-<h2>采购项目</h2><table id="tenders"><thead><tr><th>编号</th><th>标题</th><th>状态</th><th>截止时间</th><th>评审轮次</th><th>版本</th></tr></thead><tbody></tbody></table>
-<h2>投标元数据</h2><table id="bids"><thead><tr><th>项目</th><th>供应商</th><th>报价</th><th>状态</th><th>承诺哈希</th></tr></thead><tbody></tbody></table>
-<script>async function load(){const d=await fetch('/api/state').then(r=>r.json());document.querySelector('#tenders tbody').innerHTML=d.tenders.map(r=>`<tr><td>${r.tender_no}</td><td>${r.title}</td><td>${r.status}</td><td>${r.deadline}</td><td>${r.evaluation_round}</td><td>${r.version}</td></tr>`).join('');document.querySelector('#bids tbody').innerHTML=d.bids.map(r=>`<tr><td>${r.tender_id}</td><td>${r.vendor_id}</td><td>${r.price}</td><td>${r.status}</td><td>${r.payload_hash.slice(0,12)}…</td></tr>`).join('')}load()</script></html>
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>公共采购密封投标</title>
+<style>
+  body{font:15px/1.6 system-ui,sans-serif;max-width:1180px;margin:28px auto;padding:0 20px;color:#28343e}
+  table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d5dde3;padding:7px}th{background:#eef4f7}
+  .card{background:#eef8f3;border-left:5px solid #23845b;padding:12px 16px}
+  code{background:#edf0f2;padding:2px 5px}
+  .bar{position:sticky;top:0;background:#fff;border-bottom:1px solid #d5dde3;padding:8px 0;margin-bottom:12px;z-index:2}
+  .bar input,.bar select{padding:5px;margin-right:8px}
+  .clickable{cursor:pointer;color:#155e75}.clickable:hover{text-decoration:underline}
+  .tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;background:#e2e8f0}
+  .tag.correction{background:#fde68a}.tag.original{background:#d1fae5}.tag.no{background:#fecaca}
+  .muted{color:#64748b}h2{margin-top:28px}
+</style>
+<h1>公共采购密封投标与评审</h1>
+<div class="card">写接口需要 <code>X-User</code>、<code>X-Role</code> 请求头。原评分只可查看；监督员指定接手人并写明交接原因后，接手人方可提交更正分值，旧值/新值/处理时间全部留痕；排名与授标快照按有效分值重算，历史快照仍可追查。</div>
+<div class="bar">
+  身份 <input id="user" placeholder="X-User" value="sup1" size="10">
+  <select id="role">
+    <option>procurement</option><option>vendor</option><option>evaluator</option>
+    <option selected>supervisor</option><option>auditor</option><option>public</option>
+  </select>
+  <button onclick="loadState()">刷新</button>
+</div>
+<h2>采购项目（点击编号查看详情）</h2>
+<table id="tenders"><thead><tr><th>编号</th><th>标题</th><th>状态</th><th>截止时间</th><th>评审轮次</th><th>授标</th><th>版本</th></tr></thead><tbody></tbody></table>
+<div id="detail"></div>
+<h2>投标元数据</h2>
+<table id="bids"><thead><tr><th>项目</th><th>供应商</th><th>报价</th><th>状态</th><th>承诺哈希</th></tr></thead><tbody></tbody></table>
+<script>
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function headers(){return {'X-User':document.getElementById('user').value.trim(),'X-Role':document.getElementById('role').value};}
+async function api(path,opt){const r=await fetch(path,Object.assign({headers:headers()},opt));return r.json();}
+function tag(kind,txt){return `<span class="tag ${kind}">${txt}</span>`;}
+async function loadState(){
+  const d=await api('/api/state');
+  document.querySelector('#tenders tbody').innerHTML=d.tenders.map(r=>
+    `<tr><td class="clickable" onclick="loadTender(${r.id})">${esc(r.tender_no)}</td><td>${esc(r.title)}</td><td>${esc(r.status)}</td><td>${esc(r.deadline)}</td><td>${r.evaluation_round}</td><td>${r.awarded_bid_id??'-'}</td><td>${r.version}</td></tr>`).join('');
+  document.querySelector('#bids tbody').innerHTML=(d.bids||[]).map(r=>
+    `<tr><td>${r.tender_id}</td><td>${r.vendor_id}</td><td>${r.price}</td><td>${esc(r.status)}</td><td>${esc((r.payload_hash||'').slice(0,12))}…</td></tr>`).join('');
+}
+async function loadTender(id){
+  const d=await api('/api/tenders/'+id);
+  if(d.error){document.getElementById('detail').innerHTML=`<h2>项目详情</h2><p class="tag no">${esc(d.error)}</p>`;return;}
+  const t=d.tender, H=x=>esc(x);
+  let html=`<h2>项目详情 · ${H(t.tender_no)}</h2><p>状态 <span class="tag">${H(t.status)}</span> 评审轮次 ${t.evaluation_round} 版本 ${t.version}</p>`;
+  if(d.award_snapshot){
+    const a=d.award_snapshot;
+    html+=`<h3>授标快照（第 ${a.round} 轮 · ${H(a.awarded_at)} · 依据${a.basis==='effective_scores'?'有效分值':'原分值'} · 更正 ${a.correction_count||0} 项）</h3>
+      <table><thead><tr><th>名次</th><th>投标</th><th>供应商</th><th>报价</th><th>得分</th><th>更正数</th></tr></thead><tbody>`+
+      a.ranking.map((r,i)=>`<tr${i===0?' style="font-weight:600"':''}><td>${i+1}</td><td>${r.bid_id}</td><td>${r.vendor_id}</td><td>${r.price}</td><td>${r.score}</td><td>${r.correction_count||0}</td></tr>`).join('')+
+      `</tbody></table>`;
+  }
+  if(d.live_ranking){
+    html+=`<h3>当前排名（按有效分值实时重算）</h3><table><thead><tr><th>名次</th><th>投标</th><th>供应商</th><th>报价</th><th>有效得分</th><th>更正数</th></tr></thead><tbody>`+
+      d.live_ranking.map((r,i)=>`<tr><td>${i+1}</td><td>${r.bid_id}</td><td>${r.vendor_id}</td><td>${r.price}</td><td>${r.score}</td><td>${r.correction_count||0}</td></tr>`).join('')+`</tbody></table>`;
+  }
+  if(d.effective_scores){
+    html+=`<h3>有效分值</h3><table><thead><tr><th>投标</th><th>评分项</th><th>原始值/得分</th><th>有效原始值/得分</th><th>有效评审人</th><th>来源</th></tr></thead><tbody>`+
+      d.effective_scores.flatMap(b=>b.criteria.map(c=>`<tr><td>${b.bid_id}${b.complete?'':tag('no','评分未完')}</td><td>${H(c.name)}</td><td class="muted">原 ${c.source==='correction'?'见更正记录':'-'}</td><td>${c.raw_value} / ${Number(c.score).toFixed(2)}</td><td>${H(c.evaluator)}</td><td>${c.source==='correction'?tag('correction','更正#'+c.correction_id):tag('original','原始')}</td></tr>`)).join('')+`</tbody></table>`;
+  }
+  if(d.score_corrections){
+    html+=`<h3>评分更正记录（旧值/新值留痕，原记录不可改）</h3><table><thead><tr><th>#</th><th>时间</th><th>投标</th><th>评分项</th><th>离场专家</th><th>接手人</th><th>旧值→新值</th><th>旧分→新分</th><th>交接原因</th><th>备注</th></tr></thead><tbody>`+
+      (d.score_corrections.length?d.score_corrections.map(c=>`<tr><td>${c.id}</td><td>${H(c.created_at)}</td><td>${c.bid_id}</td><td>${H(c.criterion)}</td><td>${H(c.from_evaluator)}</td><td>${H(c.to_evaluator)}</td><td>${c.old_raw_value} → ${c.new_raw_value}</td><td>${Number(c.old_score).toFixed(2)} → ${Number(c.new_score).toFixed(2)}</td><td>${H(c.handover_reason)}</td><td>${H(c.comment)}</td></tr>`).join(''):'<tr><td colspan="10" class="muted">暂无更正</td></tr>')+`</tbody></table>`;
+  }
+  if(d.evaluator_handovers){
+    html+=`<h3>专家交接（监督员指定）</h3><table><thead><tr><th>#</th><th>时间</th><th>离场专家</th><th>接手人</th><th>原因</th><th>指定人</th></tr></thead><tbody>`+
+      (d.evaluator_handovers.length?d.evaluator_handovers.map(h=>`<tr><td>${h.id}</td><td>${H(h.created_at)}</td><td>${H(h.from_evaluator)}</td><td>${H(h.to_evaluator)}</td><td>${H(h.reason)}</td><td>${H(h.designated_by)}</td></tr>`).join(''):'<tr><td colspan="6" class="muted">暂无交接</td></tr>')+`</tbody></table>`;
+  }
+  if(d.ranking_snapshots){
+    html+=`<h3>历史排名快照</h3><table><thead><tr><th>#</th><th>轮次</th><th>类型</th><th>生成人</th><th>时间</th></tr></thead><tbody>`+
+      (d.ranking_snapshots.length?d.ranking_snapshots.map(s=>`<tr><td>${s.id}</td><td>${s.evaluation_round}</td><td>${H(s.kind)}</td><td>${H(s.created_by)}</td><td>${H(s.created_at)}</td></tr>`).join(''):'<tr><td colspan="5" class="muted">暂无快照</td></tr>')+`</tbody></table>`;
+  }
+  document.getElementById('detail').innerHTML=html;
+}
+document.getElementById('role').addEventListener('change',loadState);
+loadState();
+</script>
+</html>
